@@ -241,7 +241,7 @@ def make_container(host, url, is_child):
             time.sleep(20)
 
 
-def publish(urls, caption):
+def publish_instagram(urls, caption):
     host = pick_host()
     print(f"Using {host}")
     if len(urls) == 1:
@@ -265,6 +265,62 @@ def publish(urls, caption):
     wait_ready(host, cid)
     post = api(host, "POST", f"{USER_ID}/media_publish", creation_id=cid)
     print(f"Posted! Instagram media id: {post['id']}")
+
+
+# ---------------- THREADS ----------------
+THREADS_TOKEN = os.environ.get("THREADS_ACCESS_TOKEN", "").strip()
+THREADS_API = "https://graph.threads.net/v1.0"
+
+
+def threads_api(method, path, **params):
+    params["access_token"] = THREADS_TOKEN
+    url = f"{THREADS_API}/{path}"
+    r = requests.request(method, url, data=params if method == "POST" else None,
+                         params=params if method == "GET" else None, timeout=60)
+    try:
+        data = r.json()
+    except ValueError:
+        raise ApiError(f"{r.status_code}: {r.text[:300]}")
+    if r.status_code != 200 or "error" in data:
+        err = data.get("error", {})
+        raise ApiError(f"{err.get('message', data)} (code {err.get('code')})")
+    return data
+
+
+def threads_wait(container_id):
+    for _ in range(30):
+        st = threads_api("GET", container_id, fields="status,error_message")
+        if st.get("status") == "FINISHED":
+            return
+        if st.get("status") in ("ERROR", "EXPIRED"):
+            raise ApiError(f"Threads couldn't process media: {st.get('error_message')}")
+        time.sleep(5)
+    raise ApiError("Timed out waiting for Threads to process the images")
+
+
+def threads_container(**params):
+    for attempt in range(6):
+        try:
+            return threads_api("POST", "me/threads", **params)["id"]
+        except ApiError as e:
+            if attempt == 5:
+                raise
+            print(f"  Threads: image not ready yet ({e}), retrying in 20s…")
+            time.sleep(20)
+
+
+def publish_threads(urls, text):
+    if len(urls) == 1:
+        cid = threads_container(media_type="IMAGE", image_url=urls[0], text=text)
+    else:
+        kids = [threads_container(media_type="IMAGE", image_url=u, is_carousel_item="true")
+                for u in urls]
+        for k in kids:
+            threads_wait(k)
+        cid = threads_container(media_type="CAROUSEL", children=",".join(kids), text=text)
+    threads_wait(cid)
+    post = threads_api("POST", "me/threads_publish", creation_id=cid)
+    print(f"Posted to Threads! id: {post['id']}")
 
 
 # ---------------- MAIN ----------------
@@ -293,8 +349,8 @@ def main():
         print("DRY_RUN is on, not posting. Caption would be:\n" + caption)
         return
 
-    if not TOKEN or not USER_ID:
-        sys.exit("Missing IG_ACCESS_TOKEN or IG_USER_ID secret.")
+    if not (TOKEN and USER_ID) and not THREADS_TOKEN:
+        sys.exit("No platform secrets found (IG_ACCESS_TOKEN/IG_USER_ID or THREADS_ACCESS_TOKEN).")
 
     state["next_quote"] = start + SLIDES_PER_POST
     state["posts"] = n + 1
@@ -302,7 +358,25 @@ def main():
     push_images(paths + [STATE_FILE], f"Post {n + 1}: slides {stamp}")
     time.sleep(15)  # give GitHub a moment to serve the new files
 
-    publish([public_url(p) for p in paths], caption)
+    urls = [public_url(p) for p in paths]
+    # Threads allows only one hashtag, so it gets the caption without the hashtag block
+    threads_text = f"{caption.split(chr(10))[0]}\n\n{FOLLOW_LINE}"
+
+    failed = []
+    platforms = []
+    if TOKEN and USER_ID:
+        platforms.append(("Instagram", lambda: publish_instagram(urls, caption)))
+    if THREADS_TOKEN:
+        platforms.append(("Threads", lambda: publish_threads(urls, threads_text)))
+    for name, fn in platforms:
+        print(f"--- {name} ---")
+        try:
+            fn()
+        except Exception as e:          # one platform failing doesn't stop the others
+            print(f"{name} FAILED: {e}")
+            failed.append(name)
+    if failed:
+        sys.exit(f"These platforms failed: {', '.join(failed)}")
 
 
 if __name__ == "__main__":
